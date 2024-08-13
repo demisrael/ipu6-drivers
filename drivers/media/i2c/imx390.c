@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (c) 2022 Intel Corporation.
+// Copyright (c) 2021-2024 Intel Corporation.
 
 #include <asm/unaligned.h>
 #include <linux/acpi.h>
@@ -1077,8 +1077,11 @@ static int imx390_read_reg(struct imx390 *imx390, u16 reg, u16 len, u32 *val)
 	u8 data_buf[4] = {0};
 	int ret;
 
-	if (len > 4)
+	if (len > 4) {
+		dev_err(&client->dev, "%s: invalid length %d. i2c read register failed\n",
+			__func__, len);
 		return -EINVAL;
+	}
 
 	put_unaligned_be16(reg, addr_buf);
 	msgs[0].addr = client->addr;
@@ -1091,8 +1094,11 @@ static int imx390_read_reg(struct imx390 *imx390, u16 reg, u16 len, u32 *val)
 	msgs[1].buf = &data_buf[4 - len];
 
 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	if (ret != ARRAY_SIZE(msgs))
+	if (ret != ARRAY_SIZE(msgs)) {
+		dev_err(&client->dev, "%s: i2c read register 0x%x from 0x%x failed\n",
+			__func__, reg, client->addr);
 		return -EIO;
+	}
 
 	*val = get_unaligned_be32(data_buf);
 
@@ -1104,14 +1110,20 @@ static int imx390_write_reg(struct imx390 *imx390, u16 reg, u16 len, u32 val)
 	struct i2c_client *client = v4l2_get_subdevdata(&imx390->sd);
 	u8 buf[6];
 
-	if (len > 4)
+	if (len > 4) {
+		dev_err(&client->dev, "%s: invalid length %d. i2c write register failed\n",
+			__func__, len);
 		return -EINVAL;
+	}
 
 	dev_dbg(&client->dev, "%s, reg %x len %x, val %x\n", __func__, reg, len, val);
 	put_unaligned_be16(reg, buf);
 	put_unaligned_be32(val << 8 * (4 - len), buf + 2);
-	if (i2c_master_send(client, buf, len + 2) != len + 2)
+	if (i2c_master_send(client, buf, len + 2) != len + 2) {
+		dev_err(&client->dev, "%s: i2c write register 0x%x from 0x%x failed\n",
+			__func__, reg, client->addr);
 		return -EIO;
+	}
 
 	return 0;
 }
@@ -1634,8 +1646,16 @@ static int imx390_set_stream(struct v4l2_subdev *sd, int enable)
 	return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+/* pad ops */
+static int imx390_g_frame_interval(struct v4l2_subdev *sd,
+				       struct v4l2_subdev_state *sd_state,
+		struct v4l2_subdev_frame_interval *fival)
+#else
+/* Video ops */
 static int imx390_g_frame_interval(struct v4l2_subdev *sd,
 		struct v4l2_subdev_frame_interval *fival)
+#endif
 {
 	struct imx390 *imx390 = to_imx390(sd);
 
@@ -1694,7 +1714,6 @@ static int imx390_set_format(struct v4l2_subdev *sd,
 {
 	struct imx390 *imx390 = to_imx390(sd);
 	const struct imx390_mode *mode;
-	int ret = 0;
 	s32 vblank_def;
 	s64 hblank;
 	int i;
@@ -1720,8 +1739,10 @@ static int imx390_set_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
+#else
+		*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
 #endif
 	} else {
 		imx390->cur_mode = mode;
@@ -1768,8 +1789,11 @@ static int imx390_get_format(struct v4l2_subdev *sd,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&imx390->sd, cfg,
 							  fmt->pad);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&imx390->sd, sd_state,
+							  fmt->pad);
+#else
+		fmt->format = *v4l2_subdev_state_get_format(sd_state,
 							  fmt->pad);
 #endif
 	else
@@ -1870,9 +1894,12 @@ static int imx390_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 	imx390_update_pad_format(&supported_modes[0],
 				 v4l2_subdev_get_try_format(sd, fh->pad, 0));
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	imx390_update_pad_format(&supported_modes[0],
 				 v4l2_subdev_get_try_format(sd, fh->state, 0));
+#else
+	imx390_update_pad_format(&supported_modes[0],
+				 v4l2_subdev_state_get_format(fh->state, 0));
 #endif
 	mutex_unlock(&imx390->mutex);
 
@@ -1881,7 +1908,9 @@ static int imx390_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 
 static const struct v4l2_subdev_video_ops imx390_video_ops = {
 	.s_stream = imx390_set_stream,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	.g_frame_interval = imx390_g_frame_interval,
+#endif
 };
 
 static const struct v4l2_subdev_pad_ops imx390_pad_ops = {
@@ -1891,6 +1920,9 @@ static const struct v4l2_subdev_pad_ops imx390_pad_ops = {
 	.enum_mbus_code = imx390_enum_mbus_code,
 	.enum_frame_size = imx390_enum_frame_size,
 	.enum_frame_interval = imx390_enum_frame_interval,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	.get_frame_interval = imx390_g_frame_interval,
+#endif
 };
 
 static const struct v4l2_subdev_ops imx390_subdev_ops = {
@@ -1929,7 +1961,11 @@ static int imx390_identify_module(struct imx390 *imx390)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 static int imx390_remove(struct i2c_client *client)
+#else
+static void imx390_remove(struct i2c_client *client)
+#endif
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx390 *imx390 = to_imx390(sd);
@@ -1940,7 +1976,9 @@ static int imx390_remove(struct i2c_client *client)
 	pm_runtime_disable(&client->dev);
 	mutex_destroy(&imx390->mutex);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 	return 0;
+#endif
 }
 
 irqreturn_t imx390_threaded_irq_fn(int irq, void *dev_id)
@@ -2045,6 +2083,7 @@ static int imx390_probe(struct i2c_client *client)
 	pm_runtime_set_active(&client->dev);
 	pm_runtime_enable(&client->dev);
 	pm_runtime_idle(&client->dev);
+	dev_err(&client->dev, "Probe Succeeded");
 
 	return 0;
 
@@ -2054,6 +2093,7 @@ probe_error_media_entity_cleanup:
 probe_error_v4l2_ctrl_handler_free:
 	v4l2_ctrl_handler_free(imx390->sd.ctrl_handler);
 	mutex_destroy(&imx390->mutex);
+	dev_err(&client->dev, "Probe Failed");
 
 	return ret;
 }
@@ -2073,7 +2113,11 @@ static struct i2c_driver imx390_i2c_driver = {
 		.name = "imx390",
 		.pm = &imx390_pm_ops,
 	},
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 	.probe_new = imx390_probe,
+#else
+	.probe = imx390_probe,
+#endif
 	.remove = imx390_remove,
 	.id_table = imx390_id_table,
 };

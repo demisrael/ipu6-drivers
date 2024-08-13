@@ -3,7 +3,9 @@
 
 #include <asm/unaligned.h>
 #include <linux/acpi.h>
+#include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
@@ -49,6 +51,12 @@
 #define OV02C10_DGTL_GAIN_STEP		1
 #define OV02C10_DGTL_GAIN_DEFAULT	0x0400
 
+/* Rotate */
+#define OV02C10_ROTATE_CONTROL			0x3820
+#define OV02C10_ISP_X_WIN_CONTROL		0x3811
+#define OV02C10_ISP_Y_WIN_CONTROL		0x3813
+#define OV02C10_CONFIG_ROTATE			0x18
+
 /* Test Pattern Control */
 #define OV02C10_REG_TEST_PATTERN		0x4503
 #define OV02C10_TEST_PATTERN_ENABLE	BIT(7)
@@ -56,6 +64,13 @@
 
 enum {
 	OV02C10_LINK_FREQ_400MHZ_INDEX,
+};
+
+enum module_names {
+	MODULE_OTHERS = 0,
+	MODULE_2BG203N3,
+	MODULE_CJFME32,
+	MODULE_KBFC645,
 };
 
 struct ov02c10_reg {
@@ -126,6 +141,15 @@ struct mipi_camera_link_ssdb {
 	u8 mclkport;
 	u8 reserved2[13];
 } __packed;
+
+/*
+ * 822ace8f-2814-4174-a56b-5f029fe079ee
+ * This _DSM GUID returns a string from the sensor device, which acts as a
+ * module identifier.
+ */
+static const guid_t cio2_sensor_module_guid =
+	GUID_INIT(0x822ace8f, 0x2814, 0x4174,
+		  0xa5, 0x6b, 0x5f, 0x02, 0x9f, 0xe0, 0x79, 0xee);
 
 static const struct ov02c10_reg mipi_data_rate_960mbps[] = {
 };
@@ -595,6 +619,13 @@ static const char * const ov02c10_test_pattern_menu[] = {
 	"Color Bar type 4",
 };
 
+static const char * const ov02c10_module_names[] = {
+	[MODULE_OTHERS] = "",
+	[MODULE_2BG203N3] = "2BG203N3",
+	[MODULE_CJFME32] = "CJFME32",
+	[MODULE_KBFC645] = "KBFC645",
+};
+
 static const s64 link_freq_menu_items[] = {
 	OV02C10_LINK_FREQ_400MHZ,
 };
@@ -648,6 +679,12 @@ struct ov02c10 {
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hblank;
 	struct v4l2_ctrl *exposure;
+
+	struct clk *img_clk;
+	struct regulator *avdd;
+	struct gpio_desc *reset;
+	struct gpio_desc *handshake;
+
 	/* Current mode */
 	const struct ov02c10_mode *cur_mode;
 
@@ -659,6 +696,9 @@ struct ov02c10 {
 
 	/* Streaming on/off */
 	bool streaming;
+
+	/* Module name index */
+	u8 module_name_index;
 };
 
 static inline struct ov02c10 *to_ov02c10(struct v4l2_subdev *subdev)
@@ -892,6 +932,8 @@ static int ov02c10_start_streaming(struct ov02c10 *ov02c10)
 	const struct ov02c10_reg_list *reg_list;
 	int link_freq_index;
 	int ret = 0;
+	u32 rotate, shift_x, shift_y;
+
 	link_freq_index = ov02c10->cur_mode->link_freq_index;
 	reg_list = &link_freq_configs[link_freq_index].reg_list;
 	ret = ov02c10_write_reg_list(ov02c10, reg_list);
@@ -910,6 +952,52 @@ static int ov02c10_start_streaming(struct ov02c10 *ov02c10)
 	ret = __v4l2_ctrl_handler_setup(ov02c10->sd.ctrl_handler);
 	if (ret)
 		return ret;
+
+	switch (ov02c10->module_name_index) {
+	case MODULE_CJFME32:
+	case MODULE_2BG203N3:
+	case MODULE_KBFC645:
+		ret = ov02c10_read_reg(ov02c10, OV02C10_ROTATE_CONTROL,
+				       1, &rotate);
+		if (ret)
+			dev_err(&client->dev,
+				"read ROTATE_CONTROL fail: %d", ret);
+
+		ret = ov02c10_read_reg(ov02c10, OV02C10_ISP_X_WIN_CONTROL,
+				       1, &shift_x);
+		if (ret)
+			dev_err(&client->dev,
+				"read ISP_X_WIN_CONTROL fail: %d", ret);
+
+		ret = ov02c10_read_reg(ov02c10, OV02C10_ISP_Y_WIN_CONTROL,
+				       1, &shift_y);
+		if (ret)
+			dev_err(&client->dev,
+				"read ISP_Y_WIN_CONTROL fail: %d", ret);
+
+		rotate ^= OV02C10_CONFIG_ROTATE;
+		shift_x = shift_x - 1;
+		shift_y = shift_y - 1;
+
+		ret = ov02c10_write_reg(ov02c10, OV02C10_ROTATE_CONTROL,
+					1, rotate);
+		if (ret)
+			dev_err(&client->dev,
+				"write ROTATE_CONTROL fail: %d", ret);
+
+		ret = ov02c10_write_reg(ov02c10, OV02C10_ISP_X_WIN_CONTROL,
+					1, shift_x);
+		if (ret)
+			dev_err(&client->dev,
+				"write ISP_X_WIN_CONTROL fail: %d", ret);
+
+		ret = ov02c10_write_reg(ov02c10, OV02C10_ISP_Y_WIN_CONTROL,
+					1, shift_y);
+		if (ret)
+			dev_err(&client->dev,
+				"write ISP_Y_WIN_CONTROL fail: %d", ret);
+		break;
+	}
 
 	ret = ov02c10_write_reg(ov02c10, OV02C10_REG_MODE_SELECT, 1,
 				OV02C10_MODE_STREAMING);
@@ -961,6 +1049,89 @@ static int ov02c10_set_stream(struct v4l2_subdev *sd, int enable)
 
 	ov02c10->streaming = enable;
 	mutex_unlock(&ov02c10->mutex);
+
+	return ret;
+}
+
+/* This function tries to get power control resources */
+static int ov02c10_get_pm_resources(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ov02c10 *ov02c10 = to_ov02c10(sd);
+	int ret;
+
+	ov02c10->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+	if (IS_ERR(ov02c10->reset))
+		return dev_err_probe(dev, PTR_ERR(ov02c10->reset),
+				     "failed to get reset gpio\n");
+
+	ov02c10->handshake = devm_gpiod_get_optional(dev, "handshake",
+						   GPIOD_OUT_LOW);
+	if (IS_ERR(ov02c10->handshake))
+		return dev_err_probe(dev, PTR_ERR(ov02c10->handshake),
+				     "failed to get handshake gpio\n");
+
+	ov02c10->img_clk = devm_clk_get_optional(dev, NULL);
+	if (IS_ERR(ov02c10->img_clk))
+		return dev_err_probe(dev, PTR_ERR(ov02c10->img_clk),
+				     "failed to get imaging clock\n");
+
+	ov02c10->avdd = devm_regulator_get_optional(dev, "avdd");
+	if (IS_ERR(ov02c10->avdd)) {
+		ret = PTR_ERR(ov02c10->avdd);
+		ov02c10->avdd = NULL;
+		if (ret != -ENODEV)
+			return dev_err_probe(dev, ret,
+					     "failed to get avdd regulator\n");
+	}
+
+	return 0;
+}
+
+static int ov02c10_power_off(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ov02c10 *ov02c10 = to_ov02c10(sd);
+	int ret = 0;
+
+	gpiod_set_value_cansleep(ov02c10->reset, 1);
+	gpiod_set_value_cansleep(ov02c10->handshake, 0);
+
+	if (ov02c10->avdd)
+		ret = regulator_disable(ov02c10->avdd);
+
+	clk_disable_unprepare(ov02c10->img_clk);
+
+	return ret;
+}
+
+static int ov02c10_power_on(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ov02c10 *ov02c10 = to_ov02c10(sd);
+	int ret;
+
+	ret = clk_prepare_enable(ov02c10->img_clk);
+	if (ret < 0) {
+		dev_err(dev, "failed to enable imaging clock: %d", ret);
+		return ret;
+	}
+
+	if (ov02c10->avdd) {
+		ret = regulator_enable(ov02c10->avdd);
+		if (ret < 0) {
+			dev_err(dev, "failed to enable avdd: %d", ret);
+			clk_disable_unprepare(ov02c10->img_clk);
+			return ret;
+		}
+	}
+	gpiod_set_value_cansleep(ov02c10->handshake, 1);
+	gpiod_set_value_cansleep(ov02c10->reset, 0);
+
+	/* Lattice MIPI aggregator with some version FW needs longer delay
+	   after handshake triggered. We set 25ms as a safe value and wait
+	   for a stable version FW. */
+	msleep_interruptible(25);
 
 	return ret;
 }
@@ -1030,8 +1201,10 @@ static int ov02c10_set_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
+#else
+		*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
 #endif
 	} else {
 		ov02c10->cur_mode = mode;
@@ -1069,8 +1242,11 @@ static int ov02c10_get_format(struct v4l2_subdev *sd,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&ov02c10->sd, cfg,
 							  fmt->pad);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&ov02c10->sd,
+							  sd_state, fmt->pad);
+#else
+		fmt->format = *v4l2_subdev_state_get_format(
 							  sd_state, fmt->pad);
 #endif
 	else
@@ -1127,9 +1303,12 @@ static int ov02c10_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 	ov02c10_update_pad_format(&supported_modes[0],
 				  v4l2_subdev_get_try_format(sd, fh->pad, 0));
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	ov02c10_update_pad_format(&supported_modes[0],
 				  v4l2_subdev_get_try_format(sd, fh->state, 0));
+#else
+	ov02c10_update_pad_format(&supported_modes[0],
+				  v4l2_subdev_state_get_format(fh->state, 0));
 #endif
 	mutex_unlock(&ov02c10->mutex);
 
@@ -1169,7 +1348,6 @@ static void ov02c10_read_mipi_lanes(struct ov02c10 *ov02c10)
 	union acpi_object *obj;
 	acpi_status status;
 
-	ov02c10->mipi_lanes = OV02C10_DATA_LANES;
 	if (!adev) {
 		dev_info(&client->dev, "Not ACPI device\n");
 		return;
@@ -1221,7 +1399,68 @@ static int ov02c10_identify_module(struct ov02c10 *ov02c10)
 	return 0;
 }
 
+static int ov02c10_check_hwcfg(struct device *dev)
+{
+	struct v4l2_fwnode_endpoint bus_cfg = {
+		.bus_type = V4L2_MBUS_CSI2_DPHY
+	};
+	struct fwnode_handle *ep;
+	struct fwnode_handle *fwnode = dev_fwnode(dev);
+	unsigned int i, j;
+	int ret;
+	u32 ext_clk;
+
+	if (!fwnode)
+		return -ENXIO;
+
+	ep = fwnode_graph_get_next_endpoint(fwnode, NULL);
+	if (!ep)
+		return -EPROBE_DEFER;
+
+	ret = fwnode_property_read_u32(dev_fwnode(dev), "clock-frequency",
+				       &ext_clk);
+	if (ret) {
+		dev_err(dev, "can't get clock frequency");
+		return ret;
+	}
+
+	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
+	fwnode_handle_put(ep);
+	if (ret)
+		return ret;
+
+	if (!bus_cfg.nr_of_link_frequencies) {
+		dev_err(dev, "no link frequencies defined");
+		ret = -EINVAL;
+		goto out_err;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(link_freq_menu_items); i++) {
+		for (j = 0; j < bus_cfg.nr_of_link_frequencies; j++) {
+			if (link_freq_menu_items[i] ==
+				bus_cfg.link_frequencies[j])
+				break;
+		}
+
+		if (j == bus_cfg.nr_of_link_frequencies) {
+			dev_err(dev, "no link frequency %lld supported",
+				link_freq_menu_items[i]);
+			ret = -EINVAL;
+			goto out_err;
+		}
+	}
+
+out_err:
+	v4l2_fwnode_endpoint_free(&bus_cfg);
+
+	return ret;
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 static int ov02c10_remove(struct i2c_client *client)
+#else
+static void ov02c10_remove(struct i2c_client *client)
+#endif
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct ov02c10 *ov02c10 = to_ov02c10(sd);
@@ -1232,6 +1471,38 @@ static int ov02c10_remove(struct i2c_client *client)
 	pm_runtime_disable(&client->dev);
 	mutex_destroy(&ov02c10->mutex);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+	return 0;
+#endif
+}
+
+static int ov02c10_read_module_name(struct ov02c10 *ov02c10)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&ov02c10->sd);
+	struct device *dev = &client->dev;
+	union acpi_object *obj;
+	struct acpi_device *adev = ACPI_COMPANION(dev);
+	int i;
+
+	ov02c10->module_name_index = 0;
+	if (!adev)
+		return 0;
+
+	obj = acpi_evaluate_dsm_typed(adev->handle,
+				      &cio2_sensor_module_guid, 0x00,
+				      0x01, NULL, ACPI_TYPE_STRING);
+	if (!obj)
+		return 0;
+
+	dev_dbg(dev, "module name: %s", obj->string.pointer);
+	for (i = 1; i < ARRAY_SIZE(ov02c10_module_names); i++) {
+		if (!strcmp(ov02c10_module_names[i], obj->string.pointer)) {
+			ov02c10->module_name_index = i;
+			break;
+		}
+	}
+	ACPI_FREE(obj);
+
 	return 0;
 }
 
@@ -1240,13 +1511,25 @@ static int ov02c10_probe(struct i2c_client *client)
 	struct ov02c10 *ov02c10;
 	int ret = 0;
 
-	ov02c10 = devm_kzalloc(&client->dev, sizeof(*ov02c10), GFP_KERNEL);
-	if (!ov02c10) {
-		ret = -ENOMEM;
-		goto probe_error_ret;
+	/* Check HW config */
+	ret = ov02c10_check_hwcfg(&client->dev);
+	if (ret) {
+		dev_err(&client->dev, "failed to check hwcfg: %d", ret);
+		return ret;
 	}
 
+	ov02c10 = devm_kzalloc(&client->dev, sizeof(*ov02c10), GFP_KERNEL);
+	if (!ov02c10)
+		return -ENOMEM;
+
 	v4l2_i2c_subdev_init(&ov02c10->sd, client, &ov02c10_subdev_ops);
+	ov02c10_get_pm_resources(&client->dev);
+
+	ret = ov02c10_power_on(&client->dev);
+	if (ret) {
+		dev_err_probe(&client->dev, ret, "failed to power on\n");
+		return ret;
+	}
 
 	ret = ov02c10_identify_module(ov02c10);
 	if (ret) {
@@ -1254,6 +1537,7 @@ static int ov02c10_probe(struct i2c_client *client)
 		goto probe_error_ret;
 	}
 
+	ov02c10_read_module_name(ov02c10);
 	ov02c10_read_mipi_lanes(ov02c10);
 	mutex_init(&ov02c10->mutex);
 	ov02c10->cur_mode = &supported_modes[0];
@@ -1301,11 +1585,14 @@ probe_error_v4l2_ctrl_handler_free:
 	mutex_destroy(&ov02c10->mutex);
 
 probe_error_ret:
+	ov02c10_power_off(&client->dev);
+
 	return ret;
 }
 
 static const struct dev_pm_ops ov02c10_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(ov02c10_suspend, ov02c10_resume)
+	SET_RUNTIME_PM_OPS(ov02c10_power_off, ov02c10_power_on, NULL)
 };
 
 #ifdef CONFIG_ACPI
@@ -1323,7 +1610,11 @@ static struct i2c_driver ov02c10_i2c_driver = {
 		.pm = &ov02c10_pm_ops,
 		.acpi_match_table = ACPI_PTR(ov02c10_acpi_ids),
 	},
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 	.probe_new = ov02c10_probe,
+#else
+	.probe = ov02c10_probe,
+#endif
 	.remove = ov02c10_remove,
 };
 

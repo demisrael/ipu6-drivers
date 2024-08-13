@@ -1,13 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2022 Intel Corporation */
+/* Copyright (C) 2023 Intel Corporation */
 
-#ifndef D457_H
-#define D457_H
+#ifndef __LT6911UXE_H
+#define __LT6911UXE_H
 
-#define D457_NAME "d4xx"
-#define MAX9296_NAME "MAX9296"
+#include <linux/types.h>
 
-struct d4xx_pdata {
+#define LT6911UXE_NAME             "lt6911uxe"
+
+struct lt6911uxe_platform_data {
 	unsigned int port;
 	unsigned int lanes;
 	uint32_t i2c_slave_address;
@@ -20,4 +21,4 @@ struct d4xx_pdata {
 	int gpios[4];
 };
 
-#endif
+#endif /* __LT6911UXE_H  */

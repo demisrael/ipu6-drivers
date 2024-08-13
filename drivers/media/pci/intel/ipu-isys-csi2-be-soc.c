@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (C) 2014 - 2022 Intel Corporation
+// Copyright (C) 2014 - 2024 Intel Corporation
 
 #include <linux/device.h>
 #include <linux/module.h>
@@ -15,6 +15,8 @@
 #include "ipu-isys-subdev.h"
 #include "ipu-isys-video.h"
 
+extern int vnode_num;
+
 /*
  * Raw bayer format pixel order MUST BE MAINTAINED in groups of four codes.
  * Otherwise pixel order calculation below WILL BREAK!
@@ -25,6 +27,7 @@ static const u32 csi2_be_soc_supported_codes_pad[] = {
 	MEDIA_BUS_FMT_RGB888_1X24,
 	MEDIA_BUS_FMT_UYVY8_1X16,
 	MEDIA_BUS_FMT_YUYV8_1X16,
+	MEDIA_BUS_FMT_VYUY8_1X16,
 	MEDIA_BUS_FMT_SBGGR12_1X12,
 	MEDIA_BUS_FMT_SGBRG12_1X12,
 	MEDIA_BUS_FMT_SGRBG12_1X12,
@@ -38,6 +41,7 @@ static const u32 csi2_be_soc_supported_codes_pad[] = {
 	MEDIA_BUS_FMT_SGRBG8_1X8,
 	MEDIA_BUS_FMT_SRGGB8_1X8,
 	MEDIA_BUS_FMT_Y8_1X8,
+	MEDIA_BUS_FMT_FIXED,
 	0,
 };
 
@@ -108,9 +112,9 @@ __subdev_link_validate(struct v4l2_subdev *sd, struct media_link *link,
 		       struct v4l2_subdev_format *source_fmt,
 		       struct v4l2_subdev_format *sink_fmt)
 {
-	struct ipu_isys_pipeline *ip = container_of(sd->entity.pipe,
-						    struct ipu_isys_pipeline,
-						    pipe);
+	struct ipu_isys_pipeline *ip =
+		container_of(media_entity_pipeline(&sd->entity),
+			     struct ipu_isys_pipeline, pipe);
 
 	ip->csi2_be_soc = to_ipu_isys_csi2_be_soc(sd);
 	return ipu_isys_subdev_link_validate(sd, link, source_fmt, sink_fmt);
@@ -184,8 +188,38 @@ static struct v4l2_subdev_ops csi2_be_soc_sd_ops = {
 	.pad = &csi2_be_soc_sd_pad_ops,
 };
 
+static int csi2_be_soc_link_validate(struct media_link *link)
+{
+	struct media_pipeline *media_pipe;
+	struct ipu_isys_pipeline *ip;
+	struct v4l2_subdev *source_sd;
+	struct v4l2_subdev *sink_sd;
+	struct v4l2_subdev_format fmt = { 0 };
+
+	int rval;
+
+	if (!link->sink->entity || !link->source->entity)
+		return -EINVAL;
+	media_pipe = media_entity_pipeline(link->sink->entity);
+	if (!media_pipe)
+		return -EINVAL;
+
+	ip = to_ipu_isys_pipeline(media_pipe);
+	source_sd = media_entity_to_v4l2_subdev(link->source->entity);
+	sink_sd = media_entity_to_v4l2_subdev(link->sink->entity);
+
+	fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+
+	fmt.pad = CSI2_PAD_SOURCE;
+	rval = v4l2_subdev_call(source_sd, pad, get_fmt, NULL, &fmt);
+
+	fmt.pad = CSI2_BE_SOC_PAD_SINK;
+	rval = v4l2_subdev_call(sink_sd, pad, set_fmt, NULL, &fmt);
+	return v4l2_subdev_link_validate(link);
+}
+
 static struct media_entity_operations csi2_be_soc_entity_ops = {
-	.link_validate = v4l2_subdev_link_validate,
+	.link_validate = csi2_be_soc_link_validate,
 };
 
 static void csi2_be_soc_set_ffmt(struct v4l2_subdev *sd,
@@ -271,7 +305,7 @@ void ipu_isys_csi2_be_soc_cleanup(struct ipu_isys_csi2_be_soc *csi2_be_soc)
 
 	v4l2_device_unregister_subdev(&csi2_be_soc->asd.sd);
 	ipu_isys_subdev_cleanup(&csi2_be_soc->asd);
-	for (i = 0; i < NR_OF_CSI2_BE_SOC_STREAMS; i++) {
+	for (i = 0; i < vnode_num; i++) {
 		v4l2_ctrl_handler_free(&csi2_be_soc->av[i].ctrl_handler);
 		ipu_isys_video_cleanup(&csi2_be_soc->av[i]);
 	}
@@ -297,15 +331,15 @@ int ipu_isys_csi2_be_soc_init(struct ipu_isys_csi2_be_soc *csi2_be_soc,
 				    &csi2_be_soc_sd_ops, 0,
 				    NR_OF_CSI2_BE_SOC_PADS,
 				    NR_OF_CSI2_BE_SOC_SOURCE_PADS,
-				    NR_OF_CSI2_BE_SOC_SINK_PADS, 0);
+				    NR_OF_CSI2_BE_SOC_SINK_PADS, 0,
+				    CSI2_BE_SOC_PAD_SOURCE(0),
+				    CSI2_BE_SOC_PAD_SINK);
 	if (rval)
 		goto fail;
 
-	csi2_be_soc->asd.pad[CSI2_BE_SOC_PAD_SINK].flags = MEDIA_PAD_FL_SINK;
 	for (i = CSI2_BE_SOC_PAD_SOURCE(0);
 	     i < NR_OF_CSI2_BE_SOC_SOURCE_PADS + CSI2_BE_SOC_PAD_SOURCE(0);
 	     i++) {
-		csi2_be_soc->asd.pad[i].flags = MEDIA_PAD_FL_SOURCE;
 		csi2_be_soc->asd.valid_tgts[i].crop = true;
 	}
 
@@ -332,7 +366,7 @@ int ipu_isys_csi2_be_soc_init(struct ipu_isys_csi2_be_soc *csi2_be_soc,
 		goto fail;
 	}
 
-	for (i = 0; i < NR_OF_CSI2_BE_SOC_SOURCE_PADS; i++) {
+	for (i = 0; i < vnode_num; i++) {
 		if (!index)
 			snprintf(csi2_be_soc->av[i].vdev.name,
 				 sizeof(csi2_be_soc->av[i].vdev.name),

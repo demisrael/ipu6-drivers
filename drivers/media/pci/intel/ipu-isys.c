@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (C) 2013 - 2022 Intel Corporation
+// Copyright (C) 2013 - 2024 Intel Corporation
 
+#include <linux/acpi.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -13,6 +14,10 @@
 #include <linux/sched.h>
 #include <linux/version.h>
 
+#if IS_ENABLED(CONFIG_IPU_BRIDGE) && \
+LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#include <media/ipu-bridge.h>
+#endif
 #include <media/ipu-isys.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0)
 #include <media/v4l2-mc.h>
@@ -38,6 +43,10 @@
 #include "ipu-buttress.h"
 #include "ipu-platform.h"
 #include "ipu-platform-buttress-regs.h"
+
+int vnode_num = NR_OF_CSI2_BE_SOC_STREAMS;
+module_param(vnode_num, int, 0440);
+MODULE_PARM_DESC(vnode_num, "override vnode_num default value is 16");
 
 #define ISYS_PM_QOS_VALUE	300
 #if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
@@ -422,6 +431,52 @@ skip_put_adapter:
 	return rval;
 }
 
+static int isys_unregister_ext_subdev(struct ipu_isys *isys,
+				      struct ipu_isys_subdev_info *sd_info)
+{
+	struct i2c_adapter *adapter;
+	struct i2c_client *client;
+	int bus;
+
+	bus = ipu_get_i2c_bus_id(sd_info->i2c.i2c_adapter_id,
+			sd_info->i2c.i2c_adapter_bdf,
+			sizeof(sd_info->i2c.i2c_adapter_bdf));
+	if (bus < 0) {
+		dev_err(&isys->adev->dev,
+			"getting i2c bus id for adapter %d (bdf %s) failed\n",
+			sd_info->i2c.i2c_adapter_id,
+			sd_info->i2c.i2c_adapter_bdf);
+		return -ENOENT;
+	}
+	dev_dbg(&isys->adev->dev,
+		 "got i2c bus id %d for adapter %d (bdf %s)\n", bus,
+		 sd_info->i2c.i2c_adapter_id,
+		 sd_info->i2c.i2c_adapter_bdf);
+	adapter = i2c_get_adapter(bus);
+	if (!adapter) {
+		dev_warn(&isys->adev->dev, "can't find adapter\n");
+		return -ENOENT;
+	}
+
+	dev_dbg(&isys->adev->dev,
+		 "unregister i2c subdev for %s (address %2.2x, bus %d)\n",
+		 sd_info->i2c.board_info.type, sd_info->i2c.board_info.addr,
+		 bus);
+
+	client = isys_find_i2c_subdev(adapter, sd_info);
+	if (!client) {
+		dev_dbg(&isys->adev->dev, "Device not exists\n");
+		goto skip_put_adapter;
+	}
+
+	i2c_unregister_device(client);
+
+skip_put_adapter:
+	i2c_put_adapter(adapter);
+
+	return 0;
+}
+
 static void isys_register_ext_subdevs(struct ipu_isys *isys)
 {
 	struct ipu_isys_subdev_pdata *spdata = isys->pdata->spdata;
@@ -433,6 +488,18 @@ static void isys_register_ext_subdevs(struct ipu_isys *isys)
 	}
 	for (sd_info = spdata->subdevs; *sd_info; sd_info++)
 		isys_register_ext_subdev(isys, *sd_info);
+}
+
+static void isys_unregister_ext_subdevs(struct ipu_isys *isys)
+{
+	struct ipu_isys_subdev_pdata *spdata = isys->pdata->spdata;
+	struct ipu_isys_subdev_info **sd_info;
+
+	if (!spdata)
+		return;
+
+	for (sd_info = spdata->subdevs; *sd_info; sd_info++)
+		isys_unregister_ext_subdev(isys, *sd_info);
 }
 #endif
 
@@ -446,7 +513,7 @@ static void isys_unregister_subdevices(struct ipu_isys *isys)
 	for (i = 0; i < NR_OF_CSI2_BE_SOC_DEV; i++)
 		ipu_isys_csi2_be_soc_cleanup(&isys->csi2_be_soc[i]);
 
-	for (i = 0; i < csi2->nports; i++)
+	for (i = 0; i < csi2->nports && isys->csi2; i++)
 		ipu_isys_csi2_cleanup(&isys->csi2[i]);
 }
 
@@ -507,6 +574,10 @@ static int isys_register_subdevices(struct ipu_isys *isys)
 		isys->isr_csi2_bits |= IPU_ISYS_UNISPART_IRQ_CSI2(i);
 	}
 
+	if (vnode_num < 1 || vnode_num > NR_OF_CSI2_BE_SOC_STREAMS) {
+		vnode_num = NR_OF_CSI2_BE_SOC_STREAMS;
+		dev_warn(&isys->adev->dev, "Invalid video node number %d\n", vnode_num); }
+
 	for (k = 0; k < NR_OF_CSI2_BE_SOC_DEV; k++) {
 		rval = ipu_isys_csi2_be_soc_init(&isys->csi2_be_soc[k],
 						 isys, k);
@@ -562,6 +633,7 @@ fail:
 
 #if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
 /* The .bound() notifier callback when a match is found */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 static int isys_notifier_bound(struct v4l2_async_notifier *notifier,
 			       struct v4l2_subdev *sd,
 			       struct v4l2_async_subdev *asd)
@@ -587,6 +659,44 @@ static void isys_notifier_unbind(struct v4l2_async_notifier *notifier,
 
 	dev_info(&isys->adev->dev, "unbind %s\n", sd->name);
 }
+#else
+static int isys_notifier_bound(struct v4l2_async_notifier *notifier,
+			       struct v4l2_subdev *sd,
+			       struct v4l2_async_connection *asc)
+{
+	struct ipu_isys *isys = container_of(notifier,
+					struct ipu_isys, notifier);
+	struct sensor_async_sd *s_asd = container_of(asc,
+					struct sensor_async_sd, asc);
+#if IS_ENABLED(CONFIG_IPU_BRIDGE)
+	int ret;
+
+	ret = ipu_bridge_instantiate_vcm(sd->dev);
+	if (ret) {
+		dev_err(&isys->adev->dev, "instantiate vcm failed\n");
+		return ret;
+	}
+#endif
+
+	dev_info(&isys->adev->dev, "bind %s nlanes is %d port is %d\n",
+		 sd->name, s_asd->csi2.nlanes, s_asd->csi2.port);
+	ret = isys_complete_ext_device_registration(isys, sd, &s_asd->csi2);
+	if (ret)
+		return ret;
+
+	return v4l2_device_register_subdev_nodes(&isys->v4l2_dev);
+}
+
+static void isys_notifier_unbind(struct v4l2_async_notifier *notifier,
+				 struct v4l2_subdev *sd,
+				 struct v4l2_async_connection *asc)
+{
+	struct ipu_isys *isys = container_of(notifier,
+					struct ipu_isys, notifier);
+
+	dev_info(&isys->adev->dev, "unbind %s\n", sd->name);
+}
+#endif
 
 static int isys_notifier_complete(struct v4l2_async_notifier *notifier)
 {
@@ -604,6 +714,7 @@ static const struct v4l2_async_notifier_operations isys_async_ops = {
 	.complete = isys_notifier_complete,
 };
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 static int isys_fwnode_parse(struct device *dev,
 			     struct v4l2_fwnode_endpoint *vep,
 			     struct v4l2_async_subdev *asd)
@@ -616,8 +727,9 @@ static int isys_fwnode_parse(struct device *dev,
 
 	return 0;
 }
+#endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0) && LINUX_VERSION_CODE != KERNEL_VERSION(5, 15, 71)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)  || IS_ENABLED(CONFIG_DRM_I915_HAS_SRIOV)
 static int isys_notifier_init(struct ipu_isys *isys)
 {
 	struct ipu_device *isp = isys->adev->isp;
@@ -652,13 +764,7 @@ static int isys_notifier_init(struct ipu_isys *isys)
 
 	return ret;
 }
-
-static void isys_notifier_cleanup(struct ipu_isys *isys)
-{
-	v4l2_async_notifier_unregister(&isys->notifier);
-	v4l2_async_notifier_cleanup(&isys->notifier);
-}
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 static int isys_notifier_init(struct ipu_isys *isys)
 {
 	struct ipu_device *isp = isys->adev->isp;
@@ -691,7 +797,79 @@ static int isys_notifier_init(struct ipu_isys *isys)
 
 	return ret;
 }
+#else
+static int isys_notifier_init(struct ipu_isys *isys)
+{
+	const struct ipu_isys_internal_csi2_pdata *csi2 =
+	    &isys->pdata->ipdata->csi2;
+	struct ipu_device *isp = isys->adev->isp;
+	struct device *dev = &isp->pdev->dev;
+	unsigned int i;
+	int ret;
 
+	v4l2_async_nf_init(&isys->notifier, &isys->v4l2_dev);
+
+	for (i = 0; i < csi2->nports; i++) {
+		struct v4l2_fwnode_endpoint vep = {
+			.bus_type = V4L2_MBUS_CSI2_DPHY
+		};
+		struct sensor_async_sd *s_asd;
+		struct fwnode_handle *ep;
+
+		ep = fwnode_graph_get_endpoint_by_id(dev_fwnode(dev), i, 0,
+						FWNODE_GRAPH_ENDPOINT_NEXT);
+		if (!ep)
+			continue;
+
+		ret = v4l2_fwnode_endpoint_parse(ep, &vep);
+		if (ret)
+			goto err_parse;
+
+		s_asd = v4l2_async_nf_add_fwnode_remote(&isys->notifier, ep,
+							struct
+							sensor_async_sd);
+		if (IS_ERR(s_asd)) {
+			ret = PTR_ERR(s_asd);
+			goto err_parse;
+		}
+
+		s_asd->csi2.port = vep.base.port;
+		s_asd->csi2.nlanes = vep.bus.mipi_csi2.num_data_lanes;
+
+		fwnode_handle_put(ep);
+
+		continue;
+
+err_parse:
+		fwnode_handle_put(ep);
+		return ret;
+	}
+
+	if (list_empty(&isys->notifier.waiting_list)) {
+		/* isys probe could continue with async subdevs missing */
+		dev_warn(&isys->adev->dev, "no subdev found in graph\n");
+		return 0;
+	}
+
+	isys->notifier.ops = &isys_async_ops;
+	ret = v4l2_async_nf_register(&isys->notifier);
+	if (ret) {
+		dev_err(&isys->adev->dev,
+			"failed to register async notifier : %d\n", ret);
+		v4l2_async_nf_cleanup(&isys->notifier);
+	}
+
+	return ret;
+}
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0) && LINUX_VERSION_CODE != KERNEL_VERSION(5, 15, 71)
+static void isys_notifier_cleanup(struct ipu_isys *isys)
+{
+	v4l2_async_notifier_unregister(&isys->notifier);
+	v4l2_async_notifier_cleanup(&isys->notifier);
+}
+#else
 static void isys_notifier_cleanup(struct ipu_isys *isys)
 {
 	v4l2_async_nf_unregister(&isys->notifier);
@@ -720,14 +898,14 @@ static int isys_register_devices(struct ipu_isys *isys)
 #else
 	isys->media_dev.link_notify = v4l2_pipeline_link_notify;
 #endif
-	strlcpy(isys->media_dev.model,
+	strscpy(isys->media_dev.model,
 		IPU_MEDIA_DEV_MODEL_NAME, sizeof(isys->media_dev.model));
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 	isys->media_dev.driver_version = LINUX_VERSION_CODE;
 #endif
 	snprintf(isys->media_dev.bus_info, sizeof(isys->media_dev.bus_info),
 		 "pci:%s", dev_name(isys->adev->dev.parent->parent));
-	strlcpy(isys->v4l2_dev.name, isys->media_dev.model,
+	strscpy(isys->v4l2_dev.name, isys->media_dev.model,
 		sizeof(isys->v4l2_dev.name));
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
@@ -769,6 +947,8 @@ static int isys_register_devices(struct ipu_isys *isys)
 out_isys_notifier_cleanup:
 #if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
 	isys_notifier_cleanup(isys);
+#else
+	isys_unregister_ext_subdevs(isys);
 #endif
 
 #if !IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
@@ -793,6 +973,9 @@ out_media_device_unregister:
 static void isys_unregister_devices(struct ipu_isys *isys)
 {
 	isys_unregister_subdevices(isys);
+#if IS_ENABLED(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+	isys_unregister_ext_subdevs(isys);
+#endif
 	v4l2_device_unregister(&isys->v4l2_dev);
 	media_device_unregister(&isys->media_dev);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
@@ -986,6 +1169,135 @@ static void isys_remove(struct ipu_bus_device *adev)
 }
 
 #ifdef CONFIG_DEBUG_FS
+#if defined(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+#include <media/ipu-acpi-pdata.h>
+/* use as such:
+echo "0 2 d4xx 1 0x16 0x60 0x48" | sudo tee /sys/kernel/debug/intel-ipu6/isys/new_device
+<csi port> <lanes> <device name> <i2c adapter> <sensor i2c> <ser i2c> <des i2c>
+*/
+static ssize_t ipu_isys_new_device_set(struct file *flip,
+		const char __user *buffer, size_t len, loff_t *offset)
+{
+	struct ipu_isys *isys = flip->f_inode->i_private;
+
+	int res = 0;
+	int port = 0, lanes = 0, adapter = 0;
+	int sens = 0, ser = 0, des = 0;
+	char name[I2C_NAME_SIZE], end = 0;
+	char buf[128];
+	struct serdes_subdev_info *serdes_sdinfo = NULL;
+	struct serdes_platform_data *pdata = NULL;
+	struct ipu_isys_subdev_info *sd_info = NULL;
+	struct ipu_isys_csi2_config *csi2_config = NULL;
+
+	(void)offset;
+
+	if (!(isys && isys->adev && &isys->adev->dev))
+		return -EINVAL;
+	if (copy_from_user(buf, buffer, len)) {
+		pr_err("copy_from_user failed\n");
+		return 0;
+	}
+
+	buf[len] = 0;
+	dev_info(&isys->adev->dev, "isys_new_device_set function running val:%s\n", buf);
+	res = sscanf(buf, "%d %d %s %d 0x%02x 0x%02x 0x%02x%c", &port, &lanes, name, &adapter, &sens, &ser, &des, &end);
+	if (res != 8 && end != '\n') {
+		dev_err(NULL, "%s: Incorrect parameters\n", "new_device");
+		return -EINVAL;
+	}
+	dev_info(&isys->adev->dev, "res:%d, port:%d, lanes:%d, name:%s, adapter:%d, sens:0x%02x, ser:0x%02x, des:0x%02x\n",
+		res,port, lanes, name, adapter, sens, ser, des);
+
+	csi2_config = kzalloc(sizeof(*csi2_config), GFP_KERNEL);
+	if (!csi2_config) {
+		res = -ENOMEM;
+		goto error;
+	}
+	sd_info = kzalloc(sizeof(*sd_info), GFP_KERNEL);
+	if (!sd_info) {
+		res = -ENOMEM;
+		goto error;
+	}
+	pdata = kzalloc(sizeof(*pdata), GFP_KERNEL);
+	if (!pdata) {
+		res = -ENOMEM;
+		goto error;
+	}
+	serdes_sdinfo = kzalloc(sizeof(*serdes_sdinfo), GFP_KERNEL);
+	if (!serdes_sdinfo) {
+		res = -ENOMEM;
+		goto error;
+	}
+	pdata->suffix = port + 'a';
+
+	serdes_sdinfo->ser_alias = ser;
+	serdes_sdinfo->board_info.addr = des;
+	strscpy(serdes_sdinfo->board_info.type, name, I2C_NAME_SIZE);
+
+
+	pdata->subdev_num = 1;
+	pdata->subdev_info = serdes_sdinfo;
+
+	sd_info->i2c.i2c_adapter_id = adapter;
+	csi2_config->nlanes = lanes;
+	csi2_config->port = port;
+	sd_info->csi2 = csi2_config;
+	strscpy(sd_info->i2c.board_info.type, name, I2C_NAME_SIZE);
+
+	sd_info->i2c.board_info.addr = sens;
+	sd_info->i2c.board_info.platform_data = pdata;
+
+	res = isys_register_ext_subdev(isys, sd_info);
+	if (res) {
+		goto error;
+	}
+	res = v4l2_device_register_subdev_nodes(&isys->v4l2_dev);
+	if (res) {
+		isys_unregister_ext_subdev(isys, sd_info);
+		goto error;
+	}
+	return len;
+
+error:
+	if (csi2_config)
+		kfree(csi2_config);
+	if (sd_info)
+		kfree(sd_info);
+	if (pdata)
+		kfree(pdata);
+	if (serdes_sdinfo)
+		kfree(serdes_sdinfo);
+	return res;
+}
+
+static ssize_t ipu_isys_new_device_get(struct file *flip,
+		char __user *buffer, size_t len, loff_t *offset)
+{
+	struct ipu_isys *isys = flip->f_inode->i_private;
+	char msg[256] = {0};
+	static int once = 0;
+	int ret;
+
+	ret = snprintf(msg, sizeof(msg), "IPU CSI2 new device binding\n"
+		"<csi port> <lanes> <device name> <i2c-designware adapter> <sensor i2c> <ser i2c> <des i2c>\n");
+	if (copy_to_user(buffer, msg, strlen(msg))) {
+		dev_err(&isys->adev->dev, "copy_to_user failed\n");
+		ret = -EFAULT;
+	} else {
+		dev_info(&isys->adev->dev, "\n%s\n", msg);
+		once = ~once;
+		ret = strlen(msg) & once;
+	}
+	return ret;
+}
+
+static const struct file_operations isys_new_device_fops = {
+	.read = &ipu_isys_new_device_get,
+	.write = &ipu_isys_new_device_set,
+};
+#endif
+
 static int ipu_isys_icache_prefetch_get(void *data, u64 *val)
 {
 	struct ipu_isys *isys = data;
@@ -1026,7 +1338,12 @@ static int ipu_isys_init_debugfs(struct ipu_isys *isys)
 				   dir, isys, &isys_icache_prefetch_fops);
 	if (IS_ERR(file))
 		goto err;
-
+#if defined(CONFIG_VIDEO_INTEL_IPU_USE_PLATFORMDATA)
+	file = debugfs_create_file("new_device", 0600,
+		dir, isys, &isys_new_device_fops);
+	if (IS_ERR(file))
+		goto err;
+#endif
 	isys->debugfsdir = dir;
 
 #ifdef IPU_ISYS_GPC
@@ -1284,6 +1601,7 @@ static int isys_probe(struct ipu_bus_device *adev)
 	return 0;
 
 out_remove_pkg_dir_shared_buffer:
+	cpu_latency_qos_remove_request(&isys->pm_qos);
 	if (!isp->secure_mode)
 		ipu_cpd_free_pkg_dir(adev, isys->pkg_dir,
 				     isys->pkg_dir_dma_addr,
@@ -1567,3 +1885,6 @@ MODULE_AUTHOR("Yu Xia <yu.y.xia@intel.com>");
 MODULE_AUTHOR("Jerry Hu <jerry.w.hu@intel.com>");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Intel ipu input system driver");
+#if IS_ENABLED(CONFIG_IPU_BRIDGE)
+MODULE_IMPORT_NS(INTEL_IPU_BRIDGE);
+#endif

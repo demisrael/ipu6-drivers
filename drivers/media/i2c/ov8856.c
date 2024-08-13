@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (c) 2021 Intel Corporation.
+// Copyright (c) 2021-2022 Intel Corporation.
 
 #include <asm/unaligned.h>
 #include <linux/acpi.h>
@@ -1043,8 +1043,10 @@ static int ov8856_set_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
+#else
+		*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
 #endif
 	} else {
 		ov8856->cur_mode = mode;
@@ -1085,8 +1087,11 @@ static int ov8856_get_format(struct v4l2_subdev *sd,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&ov8856->sd, cfg,
 							  fmt->pad);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&ov8856->sd,
+							  sd_state, fmt->pad);
+#else
+		fmt->format = *v4l2_subdev_state_get_format(
 							  sd_state, fmt->pad);
 #endif
 	else
@@ -1144,9 +1149,12 @@ static int ov8856_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 	ov8856_update_pad_format(&supported_modes[0],
 				 v4l2_subdev_get_try_format(sd, fh->pad, 0));
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	ov8856_update_pad_format(&supported_modes[0],
 				 v4l2_subdev_get_try_format(sd, fh->state, 0));
+#else
+	ov8856_update_pad_format(&supported_modes[0],
+				 v4l2_subdev_state_get_format(fh->state, 0));
 #endif
 	mutex_unlock(&ov8856->mutex);
 
@@ -1197,7 +1205,11 @@ static int ov8856_identify_module(struct ov8856 *ov8856)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 static int ov8856_remove(struct i2c_client *client)
+#else
+static void ov8856_remove(struct i2c_client *client)
+#endif
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct ov8856 *ov8856 = to_ov8856(sd);
@@ -1208,7 +1220,9 @@ static int ov8856_remove(struct i2c_client *client)
 	pm_runtime_disable(&client->dev);
 	mutex_destroy(&ov8856->mutex);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 	return 0;
+#endif
 }
 
 static int ov8856_probe(struct i2c_client *client)
@@ -1302,7 +1316,11 @@ static struct i2c_driver ov8856_i2c_driver = {
 		.pm = &ov8856_pm_ops,
 		.acpi_match_table = ACPI_PTR(ov8856_acpi_ids),
 	},
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 	.probe_new = ov8856_probe,
+#else
+	.probe = ov8856_probe,
+#endif
 	.remove = ov8856_remove,
 	.id_table = ov8856_id_table,
 };

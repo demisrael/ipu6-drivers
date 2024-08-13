@@ -24,8 +24,6 @@
 #include <linux/version.h>
 #include <media/lt6911uxc.h>
 
-#include <linux/ipu-isys.h>
-
 /* v4l2 debug level */
 static int debug;
 module_param(debug, int, 0644);
@@ -196,8 +194,6 @@ struct lt6911uxc_state {
 	struct v4l2_ctrl *strobe_stop;
 	struct v4l2_ctrl *timeout;
 	struct v4l2_ctrl *hblank;
-	struct v4l2_ctrl *query_sub_stream;
-	struct v4l2_ctrl *set_sub_stream;
 
 	struct v4l2_dv_timings timings;
 	struct v4l2_dv_timings detected_timings;
@@ -703,87 +699,18 @@ static struct v4l2_ctrl_config lt6911uxc_frame_interval = {
 	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
 };
 
-static struct v4l2_ctrl_config lt6911uxc_q_sub_stream = {
-	.ops = &lt6911uxc_ctrl_ops,
-	.id = V4L2_CID_IPU_QUERY_SUB_STREAM,
-	.name = "query virtual channel",
-	.type = V4L2_CTRL_TYPE_INTEGER_MENU,
-	.max = 1,
-	.min = 0,
-	.def = 0,
-	.menu_skip_mask = 0,
-	.qmenu_int = NULL,
-};
-
-static const struct v4l2_ctrl_config lt6911uxc_s_sub_stream = {
-	.ops = &lt6911uxc_ctrl_ops,
-	.id = V4L2_CID_IPU_SET_SUB_STREAM,
-	.name = "set virtual channel",
-	.type = V4L2_CTRL_TYPE_INTEGER64,
-	.max = 0xFFFF,
-	.min = 0,
-	.def = 0,
-	.step = 1,
-};
-
 static u64 get_pixel_rate(struct lt6911uxc_state *lt6911uxc)
 {
-	if (lt6911uxc->cur_mode->lanes)
-		return lt6911uxc->cur_mode->width * lt6911uxc->cur_mode->height *
-			lt6911uxc->cur_mode->fps * 16 / lt6911uxc->cur_mode->lanes;
-	else
-		return 995328000; /* default value: 4K@30 */
-}
+	u64 pixel_rate = 995328000ULL; /* default value: 4K@30 */
 
-#define MIPI_CSI2_TYPE_YUV422_8         0x1e
-
-static unsigned int mbus_code_to_mipi(u32 code)
-{
-	switch (code) {
-	case MEDIA_BUS_FMT_UYVY8_1X16:
-		return MIPI_CSI2_TYPE_YUV422_8;
-	default:
-		WARN_ON(1);
-		return -EINVAL;
+	if (lt6911uxc->cur_mode->lanes) {
+		pixel_rate = (u64)lt6911uxc->cur_mode->width *
+			lt6911uxc->cur_mode->height *
+			lt6911uxc->cur_mode->fps * 16;
+		do_div(pixel_rate, lt6911uxc->cur_mode->lanes);
 	}
-}
 
-static void set_sub_stream_fmt(s64 *sub_stream, u32 code)
-{
-       *sub_stream &= 0xFFFFFFFFFFFF0000;
-       *sub_stream |= code;
-}
-
-static void set_sub_stream_h(s64 *sub_stream, u32 height)
-{
-       s64 val = height;
-       val &= 0xFFFF;
-       *sub_stream &= 0xFFFFFFFF0000FFFF;
-       *sub_stream |= val << 16;
-}
-
-static void set_sub_stream_w(s64 *sub_stream, u32 width)
-{
-       s64 val = width;
-       val &= 0xFFFF;
-       *sub_stream &= 0xFFFF0000FFFFFFFF;
-       *sub_stream |= val << 32;
-}
-
-static void set_sub_stream_dt(s64 *sub_stream, u32 dt)
-{
-       s64 val = dt;
-       val &= 0xFF;
-       *sub_stream &= 0xFF00FFFFFFFFFFFF;
-       *sub_stream |= val << 48;
-}
-
-static void set_sub_stream_vc_id(s64 *sub_stream, u32 vc_id)
-{
-       s64 val = vc_id;
-       val &= 0xFF;
-       *sub_stream &= 0x00FFFFFFFFFFFFFF;
-       *sub_stream |= val << 56;
+	return pixel_rate;
 }
 
 static int lt6911uxc_init_controls(struct lt6911uxc_state *lt6911uxc)
@@ -948,20 +875,6 @@ static int lt6911uxc_init_controls(struct lt6911uxc_state *lt6911uxc)
 		return ctrl_hdlr->error;
 	}
 
-	lt6911uxc_q_sub_stream.qmenu_int = &lt6911uxc->sub_stream;
-	lt6911uxc->query_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &lt6911uxc_q_sub_stream, NULL);
-	if (ctrl_hdlr->error) {
-		dev_dbg(&client->dev, "Set query sub stream ctrl, error = %d.\n",
-			ctrl_hdlr->error);
-		return ctrl_hdlr->error;
-	}
-	lt6911uxc->set_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &lt6911uxc_s_sub_stream, NULL);
-	if (ctrl_hdlr->error) {
-		dev_dbg(&client->dev, "Set set sub stream ctrl, error = %d.\n",
-			ctrl_hdlr->error);
-		return ctrl_hdlr->error;
-	}
-
 	lt6911uxc->sd.ctrl_handler = ctrl_hdlr;
 	return 0;
 }
@@ -1035,7 +948,12 @@ static int lt6911uxc_set_stream(struct v4l2_subdev *sd, int enable)
 }
 
 static int lt6911uxc_g_frame_interval(struct v4l2_subdev *sd,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		struct v4l2_subdev_frame_interval *fival)
+#else
+		struct v4l2_subdev_state *sd_state,
+		 struct v4l2_subdev_frame_interval *fival)
+#endif
 {
 	struct lt6911uxc_state *lt6911uxc = to_state(sd);
 
@@ -1063,8 +981,10 @@ static int lt6911uxc_set_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
+#else
+		*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
 #endif
 	} else {
 		__v4l2_ctrl_s_ctrl(lt6911uxc->link_freq,
@@ -1095,11 +1015,6 @@ static int lt6911uxc_set_format(struct v4l2_subdev *sd,
 		else
 			__v4l2_ctrl_s_ctrl(lt6911uxc->frame_interval, 33);
 	}
-	set_sub_stream_fmt(&lt6911uxc->sub_stream, fmt->format.code);
-	set_sub_stream_h(&lt6911uxc->sub_stream, fmt->format.height);
-	set_sub_stream_w(&lt6911uxc->sub_stream, fmt->format.width);
-	set_sub_stream_dt(&lt6911uxc->sub_stream, mbus_code_to_mipi(fmt->format.code));
-	set_sub_stream_vc_id(&lt6911uxc->sub_stream, 0);
 	mutex_unlock(&lt6911uxc->mutex);
 
 	return 0;
@@ -1120,8 +1035,11 @@ static int lt6911uxc_get_format(struct v4l2_subdev *sd,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&lt6911uxc->sd, cfg,
 							  fmt->pad);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&lt6911uxc->sd, sd_state,
+							fmt->pad);
+#else
+		fmt->format = *v4l2_subdev_state_get_format(sd_state,
 							fmt->pad);
 #endif
 	else
@@ -1184,38 +1102,29 @@ static int lt6911uxc_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 {
 	struct lt6911uxc_state *lt6911uxc = to_state(sd);
 
-	if (!lt6911uxc->auxiliary_port)
-		lt6911uxc_set_stream(sd, true);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 	lt6911uxc_update_pad_format(lt6911uxc->cur_mode,
 			v4l2_subdev_get_try_format(sd, fh->pad, 0));
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	lt6911uxc_update_pad_format(lt6911uxc->cur_mode,
 			v4l2_subdev_get_try_format(sd, fh->state, 0));
+#else
+	lt6911uxc_update_pad_format(lt6911uxc->cur_mode,
+			v4l2_subdev_state_get_format(fh->state, 0));
 #endif
-
-	return 0;
-}
-
-static int lt6911uxc_close(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
-{
-
-	struct lt6911uxc_state *lt6911uxc = to_state(sd);
-
-	if (!lt6911uxc->auxiliary_port)
-		lt6911uxc_set_stream(sd, false);
 
 	return 0;
 }
 
 static const struct v4l2_subdev_internal_ops lt6911uxc_subdev_internal_ops = {
 	.open = lt6911uxc_open,
-	.close = lt6911uxc_close,
 };
 
 static const struct v4l2_subdev_video_ops lt6911uxc_video_ops = {
 	.s_stream = lt6911uxc_set_stream,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	.g_frame_interval = lt6911uxc_g_frame_interval,
+#endif
 	.g_input_status	= lt6911uxc_g_input_status,
 //	.s_dv_timings	= lt6911uxc_s_dv_timings,
 	.g_dv_timings	= lt6911uxc_g_dv_timings,
@@ -1229,6 +1138,9 @@ static const struct v4l2_subdev_pad_ops lt6911uxc_pad_ops = {
 	.enum_mbus_code = lt6911uxc_enum_mbus_code,
 	.enum_frame_size = lt6911uxc_enum_frame_size,
 	.enum_frame_interval = lt6911uxc_enum_frame_interval,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	.get_frame_interval = lt6911uxc_g_frame_interval,
+#endif
 };
 
 static struct v4l2_subdev_core_ops lt6911uxc_subdev_core_ops = {
@@ -1297,7 +1209,7 @@ static int lt6911uxc_video_status_update(struct lt6911uxc_state *lt6911uxc)
 			REG_INT_HDMI);
 	switch (int_event) {
 	case INT_HDMI_STABLE:
-		dev_dbg(&client->dev, "Video signal stable\n");
+		dev_info(&client->dev, "Video signal stable\n");
 
 		/* byte clock / MIPI clock */
 		lt6911uxc_i2c_wr8(&lt6911uxc->sd,
@@ -1384,7 +1296,7 @@ static int lt6911uxc_video_status_update(struct lt6911uxc_state *lt6911uxc)
 		v4l2_subdev_notify_event(&lt6911uxc->sd,
 			&lt6911uxc_ev_stream_end);
 
-		dev_dbg(&client->dev, "Video signal disconnected\n");
+		dev_info(&client->dev, "Video signal disconnected\n");
 	break;
 	default:
 		dev_dbg(&client->dev, "Unhandled video= 0x%02X\n", int_event);
@@ -1512,6 +1424,8 @@ static int lt6911uxc_probe(struct i2c_client *client)
 		if (!gpio_get_value(lt6911uxc->platform_data->reset_pin))
 			gpio_set_value(lt6911uxc->platform_data->reset_pin, 1);
 
+	msleep(50);
+
 	if (-1 != lt6911uxc->platform_data->irq_pin) {
 		lt6911uxc->auxiliary_port = false;
 		dev_info(&client->dev, "Probing lt6911uxc chip...\n");
@@ -1621,6 +1535,8 @@ static int lt6911uxc_probe(struct i2c_client *client)
 	pm_runtime_enable(&client->dev);
 	pm_runtime_idle(&client->dev);
 	dev_info(&client->dev, "End to probe lt6911uxc Bridge Chip.\n");
+	dev_info(&client->dev, "%s Probe Succeeded", lt6911uxc->sd.name);
+
 	return 0;
 
 probe_error_media_entity_cleanup:
@@ -1629,6 +1545,7 @@ probe_error_media_entity_cleanup:
 probe_error_v4l2_ctrl_handler_free:
 	v4l2_ctrl_handler_free(lt6911uxc->sd.ctrl_handler);
 	mutex_destroy(&lt6911uxc->mutex);
+	dev_err(&client->dev, "%s Probe Failed", lt6911uxc->sd.name);
 
 	return ret;
 }
@@ -1697,7 +1614,11 @@ static struct i2c_driver lt6911uxc_i2c_driver = {
 		.name = "lt6911uxc",
 		.pm = &lt6911uxc_pm_ops,
 	},
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 	.probe_new = lt6911uxc_probe,
+#else
+	.probe = lt6911uxc_probe,
+#endif
 	.remove = lt6911uxc_remove,
 	.id_table = lt6911uxc_id_table,
 };

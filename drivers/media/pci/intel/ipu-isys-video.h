@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2013 - 2022 Intel Corporation */
+/* Copyright (C) 2013 - 2024 Intel Corporation */
 
 #ifndef IPU_ISYS_VIDEO_H
 #define IPU_ISYS_VIDEO_H
@@ -67,6 +67,7 @@ struct ipu_isys_pipeline {
 	struct media_pipeline pipe;
 	struct media_pad *external;
 	atomic_t sequence;
+	int last_sequence;
 	unsigned int seq_index;
 	struct sequence_info seq[IPU_ISYS_MAX_PARALLEL_SOF];
 	int source;	/* SSI stream source */
@@ -139,13 +140,16 @@ struct ipu_isys_video {
 	unsigned int streaming;
 	unsigned int reset;
 	unsigned int skipframe;
+	unsigned int start_streaming;
 	bool packed;
 	bool compression;
+	bool initialized;
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *compression_ctrl;
 	unsigned int ts_offsets[VIDEO_MAX_PLANES];
 	unsigned int line_header_length;	/* bits */
 	unsigned int line_footer_length;	/* bits */
+	unsigned int enum_link_state; /* state for link enumeration by vc */
 
 	const struct ipu_isys_pixelformat *
 		(*try_fmt_vid_mplane)(struct ipu_isys_video *av,
@@ -194,5 +198,10 @@ void ipu_isys_video_add_capture_done(struct ipu_isys_pipeline *ip,
 				     void (*capture_done)
 				      (struct ipu_isys_pipeline *ip,
 				       struct ipu_fw_isys_resp_info_abi *resp));
+
+bool is_support_vc(struct media_pad *source_pad,
+						struct ipu_isys_pipeline *ip);
+
+bool is_has_metadata(const struct ipu_isys_pipeline *ip);
 
 #endif /* IPU_ISYS_VIDEO_H */

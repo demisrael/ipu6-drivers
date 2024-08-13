@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (c) 2022 Intel Corporation.
+// Copyright (c) 2019-2023 Intel Corporation.
 
 #include <asm/unaligned.h>
 #include <linux/acpi.h>
@@ -15,8 +15,6 @@
 #include <media/v4l2-fwnode.h>
 #include <media/ar0234.h>
 #include <linux/version.h>
-
-#include <linux/ipu-isys.h>
 
 #define AR0234_REG_VALUE_08BIT		1
 #define AR0234_REG_VALUE_16BIT		2
@@ -1358,8 +1356,6 @@ struct ar0234 {
 	struct v4l2_ctrl *hblank;
 	struct v4l2_ctrl *vflip;
 	struct v4l2_ctrl *hflip;
-	struct v4l2_ctrl *query_sub_stream;
-	struct v4l2_ctrl *set_sub_stream;
 
 	/* Current mode */
 	const struct ar0234_mode *cur_mode;
@@ -1383,8 +1379,11 @@ static int ar0234_read_reg(struct ar0234 *ar0234, u16 reg, u16 len, u32 *val)
 	u8 data_buf[4] = {0};
 	int ret;
 
-	if (len > 4)
+	if (len > 4) {
+		dev_err(&client->dev, "%s: invalid length %d. i2c read register failed\n",
+			__func__, len);
 		return -EINVAL;
+	}
 
 	put_unaligned_be16(reg, addr_buf);
 	msgs[0].addr = client->addr;
@@ -1397,8 +1396,11 @@ static int ar0234_read_reg(struct ar0234 *ar0234, u16 reg, u16 len, u32 *val)
 	msgs[1].buf = &data_buf[4 - len];
 
 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	if (ret != ARRAY_SIZE(msgs))
+	if (ret != ARRAY_SIZE(msgs)) {
+		dev_err(&client->dev, "%s: i2c read register 0x%x from 0x%x failed\n",
+			__func__, reg, client->addr);
 		return -EIO;
+	}
 
 	*val = get_unaligned_be32(data_buf);
 
@@ -1415,13 +1417,19 @@ static int ar0234_write_reg(struct ar0234 *ar0234, u16 reg, u16 len, u32 val)
 		return 0;
 	}
 
-	if (len > 4)
+	if (len > 4) {
+		dev_err(&client->dev, "%s: invalid length %d. i2c write register failed\n",
+			__func__, len);
 		return -EINVAL;
+	}
 
 	put_unaligned_be16(reg, buf);
 	put_unaligned_be32(val << 8 * (4 - len), buf + 2);
-	if (i2c_master_send(client, buf, len + 2) != len + 2)
+	if (i2c_master_send(client, buf, len + 2) != len + 2) {
+		dev_err(&client->dev, "%s: i2c write register 0x%x from 0x%x failed\n",
+			__func__, reg, client->addr);
 		return -EIO;
+	}
 
 	return 0;
 }
@@ -1498,8 +1506,6 @@ static u64 get_hblank(struct ar0234 *ar0234)
 	return hblank;
 }
 
-static int ar0234_set_stream(struct v4l2_subdev *sd, int enable);
-
 static int ar0234_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ar0234 *ar0234 = container_of(ctrl->handler,
@@ -1508,15 +1514,6 @@ static int ar0234_set_ctrl(struct v4l2_ctrl *ctrl)
 	s64 exposure_max;
 	int ret = 0;
 	u32 val;
-
-	if (ctrl->id == V4L2_CID_IPU_SET_SUB_STREAM) {
-		val = (*ctrl->p_new.p_s64 & 0xFFFF);
-		dev_info(&client->dev, "V4L2_CID_IPU_SET_SUB_STREAM %x\n", val);
-		mutex_unlock(&ar0234->mutex);
-		ret = ar0234_set_stream(&ar0234->sd, val & 0x00FF);
-		mutex_lock(&ar0234->mutex);
-		return ret;
-	}
 
 	/* Propagate change of current control to all related controls */
 	if (ctrl->id == V4L2_CID_VBLANK) {
@@ -1611,11 +1608,7 @@ static int ar0234_set_ctrl(struct v4l2_ctrl *ctrl)
 				val);
 		dev_info(&client->dev, "set hflip %d\n", ctrl->val);
 		break;
-	case V4L2_CID_IPU_QUERY_SUB_STREAM:
-		dev_dbg(&client->dev, "query stream\n");
-		break;
 	default:
-		dev_err(&client->dev, "unexpected ctrl id 0x%08x\n", ctrl->id);
 		ret = -EINVAL;
 		break;
 	}
@@ -1634,7 +1627,7 @@ static struct v4l2_ctrl_config ar0234_csi_port = {
 	.id	= AR0234_CID_CSI_PORT,
 	.type	= V4L2_CTRL_TYPE_INTEGER,
 	.name	= "CSI port",
-	.min	= 1,
+	.min	= 0,
 	.max	= 5,
 	.def	= 1,
 	.step	= 1,
@@ -1700,83 +1693,6 @@ static struct v4l2_ctrl_config ar0234_frame_interval = {
 	.step	= 1,
 	.flags	= V4L2_CTRL_FLAG_READ_ONLY,
 };
-
-static struct v4l2_ctrl_config ar0234_q_sub_stream = {
-	.ops = &ar0234_ctrl_ops,
-	.id = V4L2_CID_IPU_QUERY_SUB_STREAM,
-	.name = "query virtual channel",
-	.type = V4L2_CTRL_TYPE_INTEGER_MENU,
-	.max = 1,
-	.min = 0,
-	.def = 0,
-	.menu_skip_mask = 0,
-	.qmenu_int = NULL,
-};
-
-static const struct v4l2_ctrl_config ar0234_s_sub_stream = {
-	.ops = &ar0234_ctrl_ops,
-	.id = V4L2_CID_IPU_SET_SUB_STREAM,
-	.name = "set virtual channel",
-	.type = V4L2_CTRL_TYPE_INTEGER64,
-	.max = 0xFFFF,
-	.min = 0,
-	.def = 0,
-	.step = 1,
-};
-
-#define MIPI_CSI2_TYPE_RAW8    0x2a
-#define MIPI_CSI2_TYPE_RAW10   0x2b
-
-static unsigned int mbus_code_to_mipi(u32 code)
-{
-	switch (code) {
-	case MEDIA_BUS_FMT_SGRBG10_1X10:
-		return MIPI_CSI2_TYPE_RAW10;
-	case MEDIA_BUS_FMT_SGRBG8_1X8:
-		return MIPI_CSI2_TYPE_RAW8;
-	default:
-		WARN_ON(1);
-		return -EINVAL;
-	}
-}
-
-static void set_sub_stream_fmt(s64 *sub_stream, u32 code)
-{
-       *sub_stream &= 0xFFFFFFFFFFFF0000;
-       *sub_stream |= code;
-}
-
-static void set_sub_stream_h(s64 *sub_stream, u32 height)
-{
-       s64 val = height;
-       val &= 0xFFFF;
-       *sub_stream &= 0xFFFFFFFF0000FFFF;
-       *sub_stream |= val << 16;
-}
-
-static void set_sub_stream_w(s64 *sub_stream, u32 width)
-{
-       s64 val = width;
-       val &= 0xFFFF;
-       *sub_stream &= 0xFFFF0000FFFFFFFF;
-       *sub_stream |= val << 32;
-}
-
-static void set_sub_stream_dt(s64 *sub_stream, u32 dt)
-{
-       s64 val = dt;
-       val &= 0xFF;
-       *sub_stream &= 0xFF00FFFFFFFFFFFF;
-       *sub_stream |= val << 48;
-}
-
-static void set_sub_stream_vc_id(s64 *sub_stream, u32 vc_id)
-{
-       s64 val = vc_id;
-       val &= 0xFF;
-       *sub_stream &= 0x00FFFFFFFFFFFFFF;
-       *sub_stream |= val << 56;
-}
 
 static int ar0234_init_controls(struct ar0234 *ar0234)
 {
@@ -1859,27 +1775,12 @@ static int ar0234_init_controls(struct ar0234 *ar0234)
 	ar0234->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &ar0234_ctrl_ops,
 					  V4L2_CID_HFLIP, 0, 1, 1, 0);
 
-	ar0234_q_sub_stream.qmenu_int = &ar0234->sub_stream;
-	ar0234->query_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &ar0234_q_sub_stream, NULL);
-	if (ctrl_hdlr->error) {
-		dev_dbg(&client->dev, "new query sub stream ctrl, error = %d.\n",
-			ctrl_hdlr->error);
-		return ctrl_hdlr->error;
-	}
-
-	ar0234->set_sub_stream = v4l2_ctrl_new_custom(ctrl_hdlr, &ar0234_s_sub_stream, NULL);
-	if (ctrl_hdlr->error) {
-		dev_dbg(&client->dev, "new set sub stream ctrl, error = %d.\n",
-			ctrl_hdlr->error);
-		return ctrl_hdlr->error;
-	}
-
 	if (ctrl_hdlr->error)
 		return ctrl_hdlr->error;
 
 	ar0234->sd.ctrl_handler = ctrl_hdlr;
 
-	return ret;
+	return 0;
 }
 
 static void ar0234_update_pad_format(const struct ar0234_mode *mode,
@@ -1914,9 +1815,7 @@ static int ar0234_start_streaming(struct ar0234 *ar0234)
 		}
 	}
 
-	ar0234->set_sub_stream->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	ret = __v4l2_ctrl_handler_setup(ar0234->sd.ctrl_handler);
-	ar0234->set_sub_stream->flags &= ~V4L2_CTRL_FLAG_READ_ONLY;
 	if (ret)
 		return ret;
 
@@ -1979,7 +1878,12 @@ static int ar0234_set_stream(struct v4l2_subdev *sd, int enable)
 }
 
 static int ar0234_g_frame_interval(struct v4l2_subdev *sd,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		struct v4l2_subdev_frame_interval *fival)
+#else
+		struct v4l2_subdev_state *sd_state,
+		 struct v4l2_subdev_frame_interval *fival)
+#endif
 {
 	struct ar0234 *ar0234 = to_ar0234(sd);
 
@@ -2065,8 +1969,10 @@ static int ar0234_set_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		*v4l2_subdev_get_try_format(sd, cfg, fmt->pad) = fmt->format;
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		*v4l2_subdev_get_try_format(sd, sd_state, fmt->pad) = fmt->format;
+#else
+		*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
 #endif
 	} else {
 		ar0234->cur_mode = mode;
@@ -2095,12 +2001,6 @@ static int ar0234_set_format(struct v4l2_subdev *sd,
 		__v4l2_ctrl_s_ctrl(ar0234->fps, mode->fps);
 
 		__v4l2_ctrl_s_ctrl(ar0234->frame_interval, 1000 / mode->fps);
-
-		set_sub_stream_fmt(&ar0234->sub_stream, mode->code);
-		set_sub_stream_h(&ar0234->sub_stream, mode->height);
-		set_sub_stream_w(&ar0234->sub_stream, mode->width);
-		set_sub_stream_dt(&ar0234->sub_stream, mbus_code_to_mipi(mode->code));
-		set_sub_stream_vc_id(&ar0234->sub_stream, 0);
 	}
 
 	mutex_unlock(&ar0234->mutex);
@@ -2123,8 +2023,11 @@ static int ar0234_get_format(struct v4l2_subdev *sd,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&ar0234->sd, cfg,
 							  fmt->pad);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		fmt->format = *v4l2_subdev_get_try_format(&ar0234->sd,
+							  sd_state, fmt->pad);
+#else
+		fmt->format = *v4l2_subdev_state_get_format(
 							  sd_state, fmt->pad);
 #endif
 	else
@@ -2209,8 +2112,10 @@ static int ar0234_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	ar0234_update_pad_format(&supported_modes[0],
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 				 v4l2_subdev_get_try_format(sd, fh->pad, 0));
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 				 v4l2_subdev_get_try_format(sd, fh->state, 0));
+#else
+				 v4l2_subdev_state_get_format(fh->state, 0));
 #endif
 	mutex_unlock(&ar0234->mutex);
 
@@ -2219,7 +2124,9 @@ static int ar0234_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 
 static const struct v4l2_subdev_video_ops ar0234_video_ops = {
 	.s_stream = ar0234_set_stream,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	.g_frame_interval = ar0234_g_frame_interval,
+#endif
 };
 
 static const struct v4l2_subdev_pad_ops ar0234_pad_ops = {
@@ -2228,6 +2135,9 @@ static const struct v4l2_subdev_pad_ops ar0234_pad_ops = {
 	.enum_mbus_code = ar0234_enum_mbus_code,
 	.enum_frame_size = ar0234_enum_frame_size,
 	.enum_frame_interval = ar0234_enum_frame_interval,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
+	.get_frame_interval = ar0234_g_frame_interval,
+#endif
 };
 
 static const struct v4l2_subdev_ops ar0234_subdev_ops = {
@@ -2263,7 +2173,11 @@ static int ar0234_identify_module(struct ar0234 *ar0234)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 static int ar0234_remove(struct i2c_client *client)
+#else
+static void ar0234_remove(struct i2c_client *client)
+#endif
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct ar0234 *ar0234 = to_ar0234(sd);
@@ -2274,7 +2188,9 @@ static int ar0234_remove(struct i2c_client *client)
 	pm_runtime_disable(&client->dev);
 	mutex_destroy(&ar0234->mutex);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
 	return 0;
+#endif
 }
 
 irqreturn_t ar0234_threaded_irq_fn(int irq, void *dev_id)
@@ -2392,6 +2308,7 @@ static int ar0234_probe(struct i2c_client *client)
 	pm_runtime_set_active(&client->dev);
 	pm_runtime_enable(&client->dev);
 	pm_runtime_idle(&client->dev);
+	dev_err(&client->dev, "%s Probe Succeeded", ar0234->sd.name);
 
 	return 0;
 
@@ -2401,6 +2318,7 @@ probe_error_media_entity_cleanup:
 probe_error_v4l2_ctrl_handler_free:
 	v4l2_ctrl_handler_free(ar0234->sd.ctrl_handler);
 	mutex_destroy(&ar0234->mutex);
+	dev_err(&client->dev, "%s Probe Failed", ar0234->sd.name);
 
 	return ret;
 }
@@ -2420,7 +2338,11 @@ static struct i2c_driver ar0234_i2c_driver = {
 		.name = "ar0234",
 		.pm = &ar0234_pm_ops,
 	},
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
 	.probe_new = ar0234_probe,
+#else
+	.probe = ar0234_probe,
+#endif
 	.remove = ar0234_remove,
 	.id_table = ar0234_id_table,
 };

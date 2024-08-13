@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2013 - 2020 Intel Corporation */
+/* Copyright (C) 2013 - 2024 Intel Corporation */
 
 #ifndef IPU_H
 #define IPU_H
@@ -76,6 +76,7 @@ struct ipu_device {
 
 	const struct firmware *cpd_fw;
 	const char *cpd_fw_name;
+	const char *cpd_fw_name_new;
 	u64 *pkg_dir;
 	dma_addr_t pkg_dir_dma_addr;
 	unsigned int pkg_dir_size;
@@ -114,5 +115,14 @@ int request_cpd_fw(const struct firmware **firmware_p, const char *name,
 		   struct device *device);
 extern enum ipu_version ipu_ver;
 void ipu_internal_pdata_init(void);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+#include <media/media-entity.h>
+/* Helpers for building against various kernel versions */
+static inline struct media_pipeline *media_entity_pipeline(struct media_entity *entity)
+{
+	return entity->pipe;
+}
+#endif
 
 #endif /* IPU_H */

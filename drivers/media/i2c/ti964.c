@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (C) 2016 - 2022 Intel Corporation
+// Copyright (C) 2016 - 2023 Intel Corporation
 
 #include <linux/device.h>
 #include <linux/gpio.h>
@@ -386,8 +386,10 @@ __ti964_get_ffmt(struct v4l2_subdev *subdev,
 	if (which == V4L2_SUBDEV_FORMAT_TRY)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 		return v4l2_subdev_get_try_format(subdev, cfg, pad);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 		return v4l2_subdev_get_try_format(subdev, sd_state, pad);
+#else
+		return v4l2_subdev_state_get_format(sd_state, pad);
 #endif
 	else
 		return &va->ffmts[pad][stream];
@@ -474,9 +476,12 @@ static int ti964_open(struct v4l2_subdev *subdev,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 14, 0)
 	struct v4l2_mbus_framefmt *try_fmt =
 		v4l2_subdev_get_try_format(subdev, fh->pad, 0);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 8, 0)
 	struct v4l2_mbus_framefmt *try_fmt =
 		v4l2_subdev_get_try_format(subdev, fh->state, 0);
+#else
+	struct v4l2_mbus_framefmt *try_fmt =
+		v4l2_subdev_state_get_format(fh->state, 0);
 #endif
 	struct v4l2_subdev_format fmt = {
 		.which = V4L2_SUBDEV_FORMAT_TRY,
@@ -1212,8 +1217,12 @@ static int ti964_gpio_direction_output(struct gpio_chip *chip,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int ti964_probe(struct i2c_client *client)
+#else
 static int ti964_probe(struct i2c_client *client,
 			const struct i2c_device_id *devid)
+#endif
 {
 	struct ti964 *va;
 	int i, rval = 0;
@@ -1395,8 +1404,8 @@ static struct i2c_driver ti964_i2c_driver = {
 		.name = TI964_NAME,
 		.pm = &ti964_pm_ops,
 	},
-	.probe	= ti964_probe,
-	.remove	= ti964_remove,
+	.probe = ti964_probe,
+	.remove = ti964_remove,
 	.id_table = ti964_id_table,
 };
 module_i2c_driver(ti964_i2c_driver);

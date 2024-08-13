@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// Copyright (C) 2013 - 2022 Intel Corporation
+// Copyright (C) 2013 - 2024 Intel Corporation
 
 #include <linux/device.h>
 #include <linux/module.h>
@@ -25,7 +25,10 @@ static const u32 csi2_supported_codes_pad_sink[] = {
 	MEDIA_BUS_FMT_RGB888_1X24,
 	MEDIA_BUS_FMT_UYVY8_1X16,
 	MEDIA_BUS_FMT_YUYV8_1X16,
+	MEDIA_BUS_FMT_VYUY8_1X16,
+#ifdef V4L2_PIX_FMT_Y210
 	MEDIA_BUS_FMT_YUYV10_1X20,
+#endif
 	MEDIA_BUS_FMT_SBGGR10_1X10,
 	MEDIA_BUS_FMT_SGBRG10_1X10,
 	MEDIA_BUS_FMT_SGRBG10_1X10,
@@ -52,7 +55,10 @@ static const u32 csi2_supported_codes_pad_source[] = {
 	MEDIA_BUS_FMT_RGB888_1X24,
 	MEDIA_BUS_FMT_UYVY8_1X16,
 	MEDIA_BUS_FMT_YUYV8_1X16,
+	MEDIA_BUS_FMT_VYUY8_1X16,
+#ifdef V4L2_PIX_FMT_Y210
 	MEDIA_BUS_FMT_YUYV10_1X20,
+#endif
 	MEDIA_BUS_FMT_SBGGR10_1X10,
 	MEDIA_BUS_FMT_SGBRG10_1X10,
 	MEDIA_BUS_FMT_SGRBG10_1X10,
@@ -78,9 +84,9 @@ static struct v4l2_subdev_internal_ops csi2_sd_internal_ops = {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 255)
 int ipu_isys_csi2_get_link_freq(struct ipu_isys_csi2 *csi2, s64 *link_freq)
 {
-	struct ipu_isys_pipeline *pipe = container_of(csi2->asd.sd.entity.pipe,
-						      struct ipu_isys_pipeline,
-						      pipe);
+	struct ipu_isys_pipeline *pipe =
+		container_of(media_entity_pipeline(&csi2->asd.sd.entity),
+			     struct ipu_isys_pipeline, pipe);
 	struct v4l2_subdev *ext_sd =
 		media_entity_to_v4l2_subdev(pipe->external->entity);
 	struct device *dev = &csi2->isys->adev->dev;
@@ -109,9 +115,9 @@ int ipu_isys_csi2_get_link_freq(struct ipu_isys_csi2 *csi2, s64 *link_freq)
 #else
 int ipu_isys_csi2_get_link_freq(struct ipu_isys_csi2 *csi2, __s64 *link_freq)
 {
-	struct ipu_isys_pipeline *pipe = container_of(csi2->asd.sd.entity.pipe,
-						      struct ipu_isys_pipeline,
-						      pipe);
+	struct ipu_isys_pipeline *pipe =
+		container_of(media_entity_pipeline(&csi2->asd.sd.entity),
+			     struct ipu_isys_pipeline, pipe);
 	struct v4l2_subdev *ext_sd =
 	    media_entity_to_v4l2_subdev(pipe->external->entity);
 	struct v4l2_ext_control c = {.id = V4L2_CID_LINK_FREQ, };
@@ -259,9 +265,8 @@ ipu_isys_csi2_calc_timing(struct ipu_isys_csi2 *csi2,
 static int set_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct ipu_isys_csi2 *csi2 = to_ipu_isys_csi2(sd);
-	struct ipu_isys_pipeline *ip = container_of(sd->entity.pipe,
-						    struct ipu_isys_pipeline,
-						    pipe);
+	struct ipu_isys_pipeline *ip =
+		to_ipu_isys_pipeline(media_entity_pipeline(&sd->entity));
 	struct ipu_isys_csi2_config *cfg;
 	struct v4l2_subdev *ext_sd;
 	struct ipu_isys_csi2_timing timing = {0};
@@ -327,41 +332,67 @@ static void csi2_capture_done(struct ipu_isys_pipeline *ip,
 
 static int csi2_link_validate(struct media_link *link)
 {
+	struct media_pipeline *media_pipe;
 	struct ipu_isys_csi2 *csi2;
 	struct ipu_isys_pipeline *ip;
-	int rval;
+	struct v4l2_subdev *source_sd;
+	struct v4l2_subdev *sink_sd;
+	struct v4l2_subdev_format fmt = { 0 };
+	int rval = 0;
 
-	if (!link->sink->entity ||
-	    !link->sink->entity->pipe || !link->source->entity)
+	if (!link->sink->entity || !link->source->entity)
+		return -EINVAL;
+	media_pipe = media_entity_pipeline(link->sink->entity);
+	if (!media_pipe)
 		return -EINVAL;
 	csi2 =
 	    to_ipu_isys_csi2(media_entity_to_v4l2_subdev(link->sink->entity));
-	ip = to_ipu_isys_pipeline(link->sink->entity->pipe);
+
+	ip = to_ipu_isys_pipeline(media_pipe);
+	if (!ip)
+		return -EINVAL;
+	if (ip->external && ip->external->entity) {
+		if (ip->external == link->source) {
+			dev_dbg(&csi2->isys->adev->dev,
+				"%s:%d: ip external entity: %s link source: %s ip->vc: %d proceed with validation\n",
+				__func__,  __LINE__, ip->external->entity->name, link->source->entity->name, ip->vc);
+		} else {
+			dev_dbg(&csi2->isys->adev->dev,
+				"%s:%d: ip external entity: %s link source: %s ip->vc: %d skip validation\n",
+				__func__,  __LINE__, ip->external->entity->name, link->source->entity->name, ip->vc);
+			return 0;
+		}
+	}
 	csi2->receiver_errors = 0;
 	ip->csi2 = csi2;
-	ipu_isys_video_add_capture_done(to_ipu_isys_pipeline
-					(link->sink->entity->pipe),
-					csi2_capture_done);
+	ipu_isys_video_add_capture_done(ip, csi2_capture_done);
+	source_sd = media_entity_to_v4l2_subdev(link->source->entity);
+	sink_sd = media_entity_to_v4l2_subdev(link->sink->entity);
+
+	if (!source_sd)
+		return -ENODEV;
+	/* source is external entity, get it's format */
+	fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+	fmt.pad = CSI2_PAD_SINK;
+	rval = v4l2_subdev_call(source_sd, pad, get_fmt, NULL, &fmt);
+	if (rval)
+		return rval;
+
+	/* set csi2 format for the same as external entity */
+	rval = v4l2_subdev_call(sink_sd, pad, set_fmt, NULL, &fmt);
+	if (rval)
+		return rval;
 
 	rval = v4l2_subdev_link_validate(link);
 	if (rval)
 		return rval;
 
-	if (!v4l2_ctrl_g_ctrl(csi2->store_csi2_header)) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
-		struct media_pad *remote_pad =
-		    media_entity_remote_pad(&csi2->asd.pad[CSI2_PAD_SOURCE]);
-#else
-		struct media_pad *remote_pad =
-		    media_pad_remote_pad_first(&csi2->asd.pad[CSI2_PAD_SOURCE]);
-#endif
-
-		if (remote_pad &&
-		    is_media_entity_v4l2_subdev(remote_pad->entity)) {
-			dev_err(&csi2->isys->adev->dev,
-				"CSI2 BE requires CSI2 headers.\n");
-			return -EINVAL;
-		}
+	if (strncmp(source_sd->name, IPU_ISYS_ENTITY_PREFIX,
+		    strlen(IPU_ISYS_ENTITY_PREFIX)) != 0) {
+		ip->external = link->source;
+		ip->source = to_ipu_isys_subdev(sink_sd)->source;
+		dev_dbg(&csi2->isys->adev->dev, "%s: using source %d\n",
+			sink_sd->entity.name, ip->source);
 	}
 
 	return 0;
@@ -408,9 +439,8 @@ static int __subdev_link_validate(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_format *source_fmt,
 				  struct v4l2_subdev_format *sink_fmt)
 {
-	struct ipu_isys_pipeline *ip = container_of(sd->entity.pipe,
-						    struct ipu_isys_pipeline,
-						    pipe);
+	struct ipu_isys_pipeline *ip =
+		to_ipu_isys_pipeline(media_entity_pipeline(&sd->entity));
 
 	if (source_fmt->format.field == V4L2_FIELD_ALTERNATE)
 		ip->interlaced = true;
@@ -561,14 +591,13 @@ int ipu_isys_csi2_init(struct ipu_isys_csi2 *csi2,
 	rval = ipu_isys_subdev_init(&csi2->asd, &csi2_sd_ops, 0,
 				    NR_OF_CSI2_PADS,
 				    NR_OF_CSI2_SOURCE_PADS,
-				    NR_OF_CSI2_SINK_PADS,
-				    0);
+				    NR_OF_CSI2_SINK_PADS, 0,
+				    CSI2_PAD_SOURCE,
+				    CSI2_PAD_SINK);
 	if (rval)
 		goto fail;
 
-	csi2->asd.pad[CSI2_PAD_SINK].flags = MEDIA_PAD_FL_SINK
-		| MEDIA_PAD_FL_MUST_CONNECT;
-	csi2->asd.pad[CSI2_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
+	csi2->asd.pad[CSI2_PAD_SINK].flags |= MEDIA_PAD_FL_MUST_CONNECT;
 
 	src = index;
 	csi2->asd.source = IPU_FW_ISYS_STREAM_SRC_CSI2_PORT0 + src;
@@ -662,6 +691,7 @@ void ipu_isys_csi2_sof_event(struct ipu_isys_csi2 *csi2, unsigned int vc)
 	}
 
 	ev.u.frame_sync.frame_sequence = atomic_inc_return(&ip->sequence) - 1;
+	ev.id = vc;
 	spin_unlock_irqrestore(&csi2->isys->lock, flags);
 
 	v4l2_event_queue(vdev, &ev);
